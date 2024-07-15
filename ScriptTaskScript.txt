@@ -1,0 +1,272 @@
+#region Help: Introduction to the script task
+/* The Script Task allows you to perform virtually any operation that can be accomplished in
+ * a .Net application within the context of an Integration Services control flow. 
+ * 
+ * Expand the other regions which have "Help" prefixes for examples of specific ways to use
+ * Integration Services features within this script task. */
+#endregion
+
+#region Namespaces
+using System;
+using System.Data;
+using Microsoft.SqlServer.Dts.Runtime;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Oracle.ManagedDataAccess.Client;
+using System.Data.SqlClient;
+using System.IO;
+#endregion
+
+namespace ST_55c9b5057b574cf0a53a59ad88cd5f3a
+{
+    [Microsoft.SqlServer.Dts.Tasks.ScriptTask.SSISScriptTaskEntryPointAttribute]
+    public partial class ScriptMain : Microsoft.SqlServer.Dts.Tasks.ScriptTask.VSTARTScriptObjectModelBase
+    {
+        private string loadID;
+
+        public void Main()
+        {
+            loadID = (string)Dts.Variables["System::ExecutionInstanceGUID"].Value;
+
+            // Use package parameters instead of variables
+            string oracleConnectionString = (string)Dts.Variables["$Package::OracleConnectionString"].Value;
+            string sqlServerConnectionString = (string)Dts.Variables["$Package::SQLServerConnectionString"].Value;
+            string masterControlTableName = (string)Dts.Variables["$Package::MasterControlTableName"].Value;
+            string mappingControlTableName = (string)Dts.Variables["$Package::MappingControlTableName"].Value;
+            string logTableName = (string)Dts.Variables["$Package::LogTableName"].Value;
+
+            try
+            {
+                LogStep("Start", "Process started", "", false, sqlServerConnectionString, logTableName);
+
+                // Step 1: Read control table from SQL Server
+                DataTable controlTable = new DataTable();
+
+                using (SqlConnection sqlConnection = new SqlConnection(sqlServerConnectionString))
+                {
+                    sqlConnection.Open();
+                    using (SqlCommand sqlCommand = new SqlCommand($"SELECT * FROM {masterControlTableName} WHERE IsActive = 1", sqlConnection))
+                    {
+                        using (SqlDataAdapter sqlDataAdapter = new SqlDataAdapter(sqlCommand))
+                        {
+                            sqlDataAdapter.Fill(controlTable);
+                        }
+                    }
+                    sqlConnection.Close();
+                }
+                LogStep("Read Control Table", "Control table read successfully", "", false, sqlServerConnectionString, logTableName);
+
+                // Process each active source table
+                foreach (DataRow masterRow in controlTable.Rows)
+                {
+                    string sourceTableName = masterRow["SourceTableName"].ToString();
+                    string sourceQuery = masterRow["SourceQuery"].ToString();
+                    string sourceFilterCondition = masterRow["SourceFilterCondition"].ToString();
+                    string targetTableName = masterRow["TargetTableName"].ToString();
+
+                    DataTable sourceDataTable = new DataTable();
+
+                    try
+                    {
+                        // Step 2: Read data from Oracle
+                        using (OracleConnection oracleConnection = new OracleConnection(oracleConnectionString))
+                        {
+                            oracleConnection.Open();
+
+                            if (!string.IsNullOrEmpty(sourceQuery))
+                            {
+                                // Use SourceQuery if provided
+                                using (OracleCommand oracleCommand = new OracleCommand(sourceQuery, oracleConnection))
+                                {
+                                    using (OracleDataReader reader = oracleCommand.ExecuteReader())
+                                    {
+                                        sourceDataTable.Load(reader);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // Construct query based on mapping table if SourceQuery is null
+                                using (SqlConnection sqlConnection = new SqlConnection(sqlServerConnectionString))
+                                {
+                                    sqlConnection.Open();
+                                    DataTable mappingTable = new DataTable();
+                                    using (SqlCommand sqlCommand = new SqlCommand($"SELECT * FROM {mappingControlTableName} WHERE MasterId = @MasterId AND IsActive = 1", sqlConnection))
+                                    {
+                                        sqlCommand.Parameters.AddWithValue("@MasterId", masterRow["Id"]);
+                                        using (SqlDataAdapter sqlDataAdapter = new SqlDataAdapter(sqlCommand))
+                                        {
+                                            sqlDataAdapter.Fill(mappingTable);
+                                        }
+                                    }
+
+                                    // Build the query to select and convert columns from Oracle
+                                    StringBuilder selectQueryBuilder = new StringBuilder();
+                                    selectQueryBuilder.Append("SELECT ");
+                                    foreach (DataRow mappingRow in mappingTable.Rows)
+                                    {
+                                        string sourceColumnName = mappingRow["SourceColumnName"].ToString();
+                                        string sourceDataType = mappingRow["SourceDataType"].ToString();
+                                        string sourceCustomConvert = mappingRow["SourceCustomConvert"].ToString();
+
+                                        if (!string.IsNullOrEmpty(sourceCustomConvert))
+                                        {
+                                            selectQueryBuilder.Append($"{sourceCustomConvert} AS {sourceColumnName}, ");
+                                        }
+                                        else if (string.IsNullOrEmpty(sourceDataType))
+                                        {
+                                            selectQueryBuilder.Append($"{sourceColumnName}, ");
+                                        }
+                                        else
+                                        {
+                                            selectQueryBuilder.Append($"CAST({sourceColumnName} AS {sourceDataType}) AS {sourceColumnName}, ");
+                                        }
+                                    }
+                                    selectQueryBuilder.Length -= 2; // Remove the last comma and space
+                                    selectQueryBuilder.Append($" FROM {sourceTableName}");
+
+                                    // Add the SourceFilterCondition if provided
+                                    if (!string.IsNullOrEmpty(sourceFilterCondition))
+                                    {
+                                        selectQueryBuilder.Append($" {sourceFilterCondition}");
+                                    }
+
+                                    File.WriteAllText(@"C:\Users\SaidnazarovOA\OneDrive - Ipoteka Bank\Documents\SQLStaging\LastRanQuery.txt", selectQueryBuilder.ToString());
+
+                                    using (OracleCommand oracleCommand = new OracleCommand(selectQueryBuilder.ToString(), oracleConnection))
+                                    {
+                                        using (OracleDataReader reader = oracleCommand.ExecuteReader())
+                                        {
+                                            sourceDataTable.Load(reader);
+                                        }
+                                    }
+                                }
+                            }
+                            oracleConnection.Close();
+                        }
+                        LogStep("Read Source Data", $"Data read successfully from {sourceTableName}", "", false, sqlServerConnectionString, logTableName);
+
+                        // Step 3: Drop and create target table in SQL Server
+                        CreateTargetTable(sqlServerConnectionString, targetTableName, masterRow["Id"].ToString(), mappingControlTableName);
+                        LogStep("Create Target Table", $"Target table {targetTableName} created successfully", "", false, sqlServerConnectionString, logTableName);
+
+                        // Step 4: Insert data into SQL Server using SqlBulkCopy
+                        using (SqlConnection sqlConnection = new SqlConnection(sqlServerConnectionString))
+                        {
+                            sqlConnection.Open();
+                            using (SqlBulkCopy sqlBulkCopy = new SqlBulkCopy(sqlConnection))
+                            {
+                                sqlBulkCopy.DestinationTableName = targetTableName;
+
+                                // Get column mappings from the control table
+                                DataTable mappingTable = new DataTable();
+                                using (SqlCommand sqlCommand = new SqlCommand($"SELECT * FROM {mappingControlTableName} WHERE MasterId = @MasterId AND IsActive = 1", sqlConnection))
+                                {
+                                    sqlCommand.Parameters.AddWithValue("@MasterId", masterRow["Id"]);
+                                    using (SqlDataAdapter sqlDataAdapter = new SqlDataAdapter(sqlCommand))
+                                    {
+                                        sqlDataAdapter.Fill(mappingTable);
+                                    }
+                                }
+
+                                // Add column mappings
+                                foreach (DataRow mappingRow in mappingTable.Rows)
+                                {
+                                    string sourceColumn = mappingRow["SourceColumnName"].ToString();
+                                    string targetColumn = mappingRow["TargetColumnName"].ToString();
+                                    sqlBulkCopy.ColumnMappings.Add(sourceColumn, targetColumn);
+                                }
+
+                                sqlBulkCopy.WriteToServer(sourceDataTable);
+                            }
+                            sqlConnection.Close();
+                        }
+                        LogStep("Insert Data", $"Data inserted successfully into {targetTableName}", "", false, sqlServerConnectionString, logTableName);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogStep("Error", $"Error processing {sourceTableName}", ex.Message, true, sqlServerConnectionString, logTableName);
+                        throw; // Re-throw the exception to stop the execution
+                    }
+                }
+
+                LogStep("End", "Process completed successfully", "", false, sqlServerConnectionString, logTableName);
+                Dts.TaskResult = (int)ScriptResults.Success;
+            }
+            catch (Exception ex)
+            {
+                LogStep("Critical Error", "Critical error occurred", ex.Message, true, sqlServerConnectionString, logTableName);
+                Dts.TaskResult = (int)ScriptResults.Failure;
+            }
+        }
+
+        private void LogStep(string stepName, string stepMessage, string stepErrorMessage, bool isError, string connectionString, string logTableName)
+        {
+            using (SqlConnection sqlConnection = new SqlConnection(connectionString))
+            {
+                sqlConnection.Open();
+                using (SqlCommand sqlCommand = new SqlCommand($"INSERT INTO {logTableName} (StepName, StepMessage, StepErrorMessage, LoadID, IsError) VALUES (@StepName, @StepMessage, @StepErrorMessage, @LoadID, @IsError)", sqlConnection))
+                {
+                    sqlCommand.Parameters.AddWithValue("@StepName", stepName);
+                    sqlCommand.Parameters.AddWithValue("@StepMessage", stepMessage);
+                    sqlCommand.Parameters.AddWithValue("@StepErrorMessage", stepErrorMessage);
+                    sqlCommand.Parameters.AddWithValue("@LoadID", loadID);
+                    sqlCommand.Parameters.AddWithValue("@IsError", isError ? 1 : 0);
+                    sqlCommand.ExecuteNonQuery();
+                }
+                sqlConnection.Close();
+            }
+        }
+
+        private void CreateTargetTable(string sqlServerConnectionString, string targetTableName, string masterId, string mappingControlTableName)
+        {
+            using (SqlConnection sqlConnection = new SqlConnection(sqlServerConnectionString))
+            {
+                sqlConnection.Open();
+                StringBuilder createTableQuery = new StringBuilder();
+
+                // Drop the target table if it already exists
+                createTableQuery.Append($"IF OBJECT_ID('{targetTableName}', 'U') IS NOT NULL DROP TABLE {targetTableName}; ");
+
+                // Create the target table
+                createTableQuery.Append($"CREATE TABLE {targetTableName} (");
+
+                // Get the columns and their target data types from the mapping table
+                using (SqlCommand sqlCommand = new SqlCommand($"SELECT * FROM {mappingControlTableName} WHERE MasterId = @MasterId AND IsActive = 1", sqlConnection))
+                {
+                    sqlCommand.Parameters.AddWithValue("@MasterId", masterId);
+                    using (SqlDataReader reader = sqlCommand.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            string targetColumnName = reader["TargetColumnName"].ToString();
+                            string targetDataType = reader["TargetDataType"].ToString();
+                            createTableQuery.Append($"{targetColumnName} {targetDataType}, ");
+                        }
+                    }
+                }
+
+                createTableQuery.Append($"[LoadTimestamp] [DATETIME] DEFAULT GETDATE(), ");
+                createTableQuery.Append($"[LoadID] [uniqueidentifier] DEFAULT '{loadID}', ");
+                createTableQuery.Length -= 2; // Remove the last comma and space
+                createTableQuery.Append(");");
+
+                using (SqlCommand sqlCommand = new SqlCommand(createTableQuery.ToString(), sqlConnection))
+                {
+                    sqlCommand.ExecuteNonQuery();
+                }
+                sqlConnection.Close();
+            }
+        }
+
+        #region ScriptResults declaration
+        enum ScriptResults
+        {
+            Success = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Success,
+            Failure = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Failure
+        };
+        #endregion
+    }
+}
