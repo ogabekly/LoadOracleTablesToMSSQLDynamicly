@@ -1,4 +1,5 @@
 # Load Oracle Tables To MSSQL Dynamicly
+-Migrating from Oracle to MSSQL
 
 Summary:
 This project dynamically transfers data from Oracle databases tables to SQL Server using SSIS Script Task based on control tables defining source-target mappings. Key features include reading mappings, fetching data from Oracle, and bulk inserting into SQL Server.
